@@ -3,8 +3,12 @@ local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local VirtualUser = game:GetService("VirtualUser")
 local RunService = game:GetService("RunService")
+local PathfindingService = game:GetService("PathfindingService")
 
 local LocalPlayer = Players.LocalPlayer
+
+-- Load Rayfield
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
 -- Anti-AFK
 LocalPlayer.Idled:Connect(function()
@@ -15,7 +19,7 @@ end)
 -- Configuration
 local FIELD_WIDTH = 30
 local FIELD_DEPTH = 20
-local SNAKE_GAP = 4
+local SNAKE_GAP = 3 -- Tighter gap for efficiency
 
 -- Data (Embedded from BSS-Zones.json)
 local ZONES = {
@@ -48,76 +52,25 @@ local ZONES = {
     }
 }
 
--- Flatten Zones for easy selection
+-- Flatten Zones for Dropdown
 local FLAT_ZONES = {}
+local ZONE_NAMES = {}
 for category, fields in pairs(ZONES) do
     for name, pos in pairs(fields) do
         table.insert(FLAT_ZONES, {Name = name, Position = pos})
+        table.insert(ZONE_NAMES, name)
     end
 end
-table.sort(FLAT_ZONES, function(a, b) return a.Name < b.Name end)
+table.sort(ZONE_NAMES)
 
 -- State Variables
 local isRunning = false
 local currentTask = nil
 local MovementMode = "Walk"
 local Pattern = "Spiral"
-local SelectedField = nil
-
--- UI Setup (Early definition so we can reference elements)
-local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "BSS_Macro_UI"
-ScreenGui.ResetOnSpawn = false
-
--- Executor Compatibility
-if RunService:IsStudio() then
-    ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-else
-    pcall(function()
-        if gethui then
-            ScreenGui.Parent = gethui()
-        elseif game:GetService("CoreGui") then
-            ScreenGui.Parent = game:GetService("CoreGui")
-        else
-            ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-        end
-    end)
-end
-
-local MainFrame = Instance.new("Frame")
-MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.new(0, 300, 0, 350)
-MainFrame.Position = UDim2.new(0.5, -150, 0.5, -175)
-MainFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
-MainFrame.BorderSizePixel = 0
-MainFrame.Active = true
-MainFrame.Draggable = true
-MainFrame.Parent = ScreenGui
-
-local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(1, 0, 0, 40)
-Title.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-Title.Text = "BSS Macro"
-Title.TextColor3 = Color3.new(1, 1, 1)
-Title.Font = Enum.Font.SourceSansBold
-Title.TextSize = 24
-Title.Parent = MainFrame
-
-local ToggleButton = Instance.new("TextButton")
-ToggleButton.Name = "ToggleButton"
-ToggleButton.Size = UDim2.new(0, 50, 0, 25)
-ToggleButton.Position = UDim2.new(1, -55, 0, 7)
-ToggleButton.Text = "-"
-ToggleButton.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-ToggleButton.TextColor3 = Color3.new(1, 1, 1)
-ToggleButton.Parent = MainFrame
-
-local ContentFrame = Instance.new("Frame")
-ContentFrame.Name = "ContentFrame"
-ContentFrame.Size = UDim2.new(1, -20, 1, -50)
-ContentFrame.Position = UDim2.new(0, 10, 0, 45)
-ContentFrame.BackgroundTransparency = 1
-ContentFrame.Parent = MainFrame
+local SelectedField = nil -- Will hold the Vector3 position
+local TweenSpeed = 30
+local AutoSprint = false
 
 -- Helper Functions
 local function getRoot()
@@ -130,22 +83,75 @@ local function getHumanoid()
     return char:WaitForChild("Humanoid")
 end
 
-local function travelTo(targetPos)
+local function getFieldPosition(name)
+    for _, z in ipairs(FLAT_ZONES) do
+        if z.Name == name then return z.Position end
+    end
+    return nil
+end
+
+-- Advanced Movement Logic
+local function travelTo(targetPos, expectedField)
     if not isRunning then return end
+
+    -- Fast seamless check
+    if expectedField and SelectedField ~= expectedField then return end
 
     local root = getRoot()
     local humanoid = getHumanoid()
 
+    -- Auto-Sprint
+    if AutoSprint then
+        humanoid.WalkSpeed = 24
+    else
+        humanoid.WalkSpeed = 16
+    end
+
     if MovementMode == "Tween" then
         local distance = (root.Position - targetPos).Magnitude
-        local speed = 40
-        local tweenInfo = TweenInfo.new(distance / speed, Enum.EasingStyle.Linear)
+        local duration = distance / TweenSpeed
+
+        local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear)
         local tween = TweenService:Create(root, tweenInfo, {CFrame = CFrame.new(targetPos)})
         tween:Play()
         tween.Completed:Wait()
-    else -- Walk
-        humanoid:MoveTo(targetPos)
-        humanoid.MoveToFinished:Wait()
+
+    else -- Walk with Pathfinding
+        local path = PathfindingService:CreatePath({
+            AgentRadius = 2,
+            AgentHeight = 5,
+            AgentCanJump = true,
+            AgentJumpHeight = 10,
+            WaypointSpacing = 4
+        })
+
+        local success, errorMessage = pcall(function()
+            path:ComputeAsync(root.Position, targetPos)
+        end)
+
+        if success and path.Status == Enum.PathStatus.Success then
+            local waypoints = path:GetWaypoints()
+            for _, waypoint in ipairs(waypoints) do
+                if not isRunning then break end
+                if expectedField and SelectedField ~= expectedField then break end -- Seamless abort
+
+                if waypoint.Action == Enum.PathWaypointAction.Jump then
+                    humanoid.Jump = true
+                end
+                humanoid:MoveTo(waypoint.Position)
+
+                -- Wait for arrival at waypoint
+                local timeOut = 0
+                while (root.Position - waypoint.Position).Magnitude > 3 and timeOut < 5 do
+                    task.wait(0.1)
+                    timeOut = timeOut + 0.1
+                end
+            end
+        else
+            -- Fallback if pathfinding fails
+            humanoid:MoveTo(targetPos)
+            humanoid.MoveToFinished:Wait()
+        end
     end
 end
 
@@ -159,7 +165,14 @@ local function clampPosition(pos, center)
     return Vector3.new(center.X + clampedX, pos.Y, center.Z + clampedZ)
 end
 
--- Pattern Logic
+-- Pattern Logic with Seamless Transition Checks
+local function checkState(originalField, originalPattern)
+    if not isRunning then return false end
+    if SelectedField ~= originalField then return false end
+    if Pattern ~= originalPattern then return false end
+    return true
+end
+
 local function runSnakePattern(center, startY)
     local minX = center.X - (FIELD_WIDTH / 2)
     local maxX = center.X + (FIELD_WIDTH / 2)
@@ -167,233 +180,250 @@ local function runSnakePattern(center, startY)
     local maxZ = center.Z + (FIELD_DEPTH / 2)
 
     local direction = 1
+    local myField = SelectedField
+    local myPattern = Pattern
 
     for z = minZ, maxZ, SNAKE_GAP do
-        if not isRunning then break end
+        if not checkState(myField, myPattern) then return end
 
         if direction == 1 then
-            travelTo(Vector3.new(minX, startY, z))
-            travelTo(Vector3.new(maxX, startY, z))
+            travelTo(Vector3.new(minX, startY, z), myField)
+            if not checkState(myField, myPattern) then return end
+            travelTo(Vector3.new(maxX, startY, z), myField)
         else
-            travelTo(Vector3.new(maxX, startY, z))
-            travelTo(Vector3.new(minX, startY, z))
+            travelTo(Vector3.new(maxX, startY, z), myField)
+            if not checkState(myField, myPattern) then return end
+            travelTo(Vector3.new(minX, startY, z), myField)
         end
 
         direction = direction * -1
     end
 end
 
-local function mainLoop()
-    if not SelectedField then return end
+local function runSpiralPattern(center, startY)
+    local radius = 2
+    local angle = 0
+    local myField = SelectedField
+    local myPattern = Pattern
 
-    local center = SelectedField.Position
-    local startY = center.Y
+    while isRunning and radius <= 20 do
+        if not checkState(myField, myPattern) then return end
 
-    -- Initial travel
-    travelTo(center)
+        angle = angle + 1
+        radius = radius + 0.5
+        local x = center.X + math.cos(angle) * radius
+        local z = center.Z + math.sin(angle) * radius
+        local target = clampPosition(Vector3.new(x, startY, z), center)
 
-    while isRunning do
-        if Pattern == "Spiral" then
-            local radius = 2
-            local angle = 0
-            while isRunning and radius <= 20 do
-                angle = angle + 1
-                radius = radius + 0.5
-                local x = center.X + math.cos(angle) * radius
-                local z = center.Z + math.sin(angle) * radius
-                local target = clampPosition(Vector3.new(x, startY, z), center)
-                travelTo(target)
-                task.wait()
-            end
-
-        elseif Pattern == "Snake" then
-            runSnakePattern(center, startY)
-
-        elseif Pattern == "Circle" then
-            for angle = 0, 360, 20 do
-                if not isRunning then break end
-                local rad = math.rad(angle)
-                local radius = 12
-                local x = center.X + math.cos(rad) * radius
-                local z = center.Z + math.sin(rad) * radius
-                local target = clampPosition(Vector3.new(x, startY, z), center)
-                travelTo(target)
-            end
-
-        elseif Pattern == "Figure-8" then
-            for t = 0, 6.28, 0.3 do
-                if not isRunning then break end
-                local scale = 12
-                local x = center.X + (scale * math.cos(t))
-                local z = center.Z + (scale * math.sin(2 * t) / 2)
-                local target = clampPosition(Vector3.new(x, startY, z), center)
-                travelTo(target)
-            end
-
-        elseif Pattern == "Random" then
-            local rX = math.random(-FIELD_WIDTH/2, FIELD_WIDTH/2)
-            local rZ = math.random(-FIELD_DEPTH/2, FIELD_DEPTH/2)
-            local target = Vector3.new(center.X + rX, startY, center.Z + rZ)
-            travelTo(target)
-            task.wait(0.5)
-        end
+        travelTo(target, myField)
         task.wait()
     end
 end
 
--- UI Components (Continued)
+local function runCirclePattern(center, startY)
+    local myField = SelectedField
+    local myPattern = Pattern
 
--- Field Selector
-local FieldLabel = Instance.new("TextLabel")
-FieldLabel.Size = UDim2.new(1, 0, 0, 20)
-FieldLabel.Text = "Select Field:"
-FieldLabel.TextColor3 = Color3.new(1, 1, 1)
-FieldLabel.BackgroundTransparency = 1
-FieldLabel.Parent = ContentFrame
+    for angle = 0, 360, 20 do
+        if not checkState(myField, myPattern) then return end
 
-local FieldScroll = Instance.new("ScrollingFrame")
-FieldScroll.Size = UDim2.new(1, 0, 0, 100)
-FieldScroll.Position = UDim2.new(0, 0, 0, 25)
-FieldScroll.CanvasSize = UDim2.new(0, 0, 0, #FLAT_ZONES * 25)
-FieldScroll.Parent = ContentFrame
+        local rad = math.rad(angle)
+        local radius = 12
+        local x = center.X + math.cos(rad) * radius
+        local z = center.Z + math.sin(rad) * radius
+        local target = clampPosition(Vector3.new(x, startY, z), center)
 
-local FieldButtons = {}
-local function updateFieldSelection(btn, fieldData)
-    for _, b in pairs(FieldButtons) do
-        b.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+        travelTo(target, myField)
     end
-    btn.BackgroundColor3 = Color3.fromRGB(0, 150, 0)
-    SelectedField = fieldData
 end
 
-for i, zone in ipairs(FLAT_ZONES) do
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(1, -10, 0, 25)
-    btn.Position = UDim2.new(0, 5, 0, (i-1) * 25)
-    btn.Text = zone.Name
-    btn.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
-    btn.TextColor3 = Color3.new(1, 1, 1)
-    btn.Parent = FieldScroll
+local function runFigure8Pattern(center, startY)
+    local myField = SelectedField
+    local myPattern = Pattern
 
-    btn.MouseButton1Click:Connect(function()
-        updateFieldSelection(btn, zone)
-    end)
-    table.insert(FieldButtons, btn)
+    for t = 0, 6.28, 0.3 do
+        if not checkState(myField, myPattern) then return end
+
+        local scale = 12
+        local x = center.X + (scale * math.cos(t))
+        local z = center.Z + (scale * math.sin(2 * t) / 2)
+        local target = clampPosition(Vector3.new(x, startY, z), center)
+
+        travelTo(target, myField)
+    end
 end
 
--- Movement Toggle
-local MoveToggleBtn = Instance.new("TextButton")
-MoveToggleBtn.Size = UDim2.new(0.45, 0, 0, 30)
-MoveToggleBtn.Position = UDim2.new(0, 0, 0, 135)
-MoveToggleBtn.Text = "Mode: Walk"
-MoveToggleBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
-MoveToggleBtn.TextColor3 = Color3.new(1, 1, 1)
-MoveToggleBtn.Parent = ContentFrame
+local function runRandomPattern(center, startY)
+    local myField = SelectedField
+    local myPattern = Pattern
 
-MoveToggleBtn.MouseButton1Click:Connect(function()
-    if MovementMode == "Walk" then
-        MovementMode = "Tween"
-    else
-        MovementMode = "Walk"
-    end
-    MoveToggleBtn.Text = "Mode: " .. MovementMode
-end)
+    if not checkState(myField, myPattern) then return end
 
--- Pattern Selector
-local PatternBtn = Instance.new("TextButton")
-PatternBtn.Size = UDim2.new(0.45, 0, 0, 30)
-PatternBtn.Position = UDim2.new(0.55, 0, 0, 135)
-PatternBtn.Text = "Pattern: Spiral"
-PatternBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
-PatternBtn.TextColor3 = Color3.new(1, 1, 1)
-PatternBtn.Parent = ContentFrame
+    local rX = math.random(-FIELD_WIDTH/2, FIELD_WIDTH/2)
+    local rZ = math.random(-FIELD_DEPTH/2, FIELD_DEPTH/2)
+    local target = Vector3.new(center.X + rX, startY, center.Z + rZ)
 
-local Patterns = {"Spiral", "Snake", "Circle", "Figure-8", "Random"}
-local PatternIndex = 1
+    travelTo(target, myField)
+    task.wait(0.5)
+end
 
-PatternBtn.MouseButton1Click:Connect(function()
-    PatternIndex = PatternIndex + 1
-    if PatternIndex > #Patterns then PatternIndex = 1 end
-    Pattern = Patterns[PatternIndex]
-    PatternBtn.Text = "Pattern: " .. Pattern
-end)
-
--- Start/Stop Button
-local StartStopBtn = Instance.new("TextButton")
-StartStopBtn.Size = UDim2.new(1, 0, 0, 40)
-StartStopBtn.Position = UDim2.new(0, 0, 1, -40)
-StartStopBtn.Text = "START"
-StartStopBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 0)
-StartStopBtn.TextColor3 = Color3.new(1, 1, 1)
-StartStopBtn.Font = Enum.Font.SourceSansBold
-StartStopBtn.TextSize = 20
-StartStopBtn.Parent = ContentFrame
-
-StartStopBtn.MouseButton1Click:Connect(function()
-    if isRunning then
-        -- Stop
-        isRunning = false
-        StartStopBtn.Text = "START"
-        StartStopBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 0)
-
-        -- Instant Stop Logic
-        if currentTask then
-            task.cancel(currentTask)
-            currentTask = nil
-        end
-
-        -- Stop character movement instantly
-        local root = getRoot()
-        local humanoid = getHumanoid()
-        humanoid:MoveTo(root.Position) -- Stop walking
-
-        -- Cancel any running tweens?
-        -- TweenService doesn't have a "StopAll" but cancelling the task stops the loop creating new ones.
-        -- If a tween is currently playing, we can cancel it if we tracked it, but task.cancel kills the thread waiting on it.
-
-    else
-        -- Start
+local function mainLoop()
+    while isRunning do
         if not SelectedField then
-            StartStopBtn.Text = "SELECT FIELD"
             task.wait(1)
-            StartStopBtn.Text = "START"
-            return
+            continue
         end
 
-        isRunning = true
-        StartStopBtn.Text = "STOP"
-        StartStopBtn.BackgroundColor3 = Color3.fromRGB(200, 0, 0)
+        local center = SelectedField
+        local startY = center.Y
 
-        currentTask = task.spawn(mainLoop)
+        -- Initial travel to center (if far away)
+        -- We can just let the pattern handle it, but starting at center is good.
+        -- But if we are seamless switching, we might already be there.
+        -- Let's just run the pattern. The first point of the pattern will trigger travelTo.
+
+        if Pattern == "Spiral" then
+            runSpiralPattern(center, startY)
+        elseif Pattern == "Snake" then
+            runSnakePattern(center, startY)
+        elseif Pattern == "Circle" then
+            runCirclePattern(center, startY)
+        elseif Pattern == "Figure-8" then
+            runFigure8Pattern(center, startY)
+        elseif Pattern == "Random" then
+            runRandomPattern(center, startY)
+        end
+
+        task.wait()
     end
-end)
-
--- Minimize Logic
-local minimized = false
-ToggleButton.MouseButton1Click:Connect(function()
-    minimized = not minimized
-    if minimized then
-        ContentFrame.Visible = false
-        MainFrame.Size = UDim2.new(0, 300, 0, 40)
-        ToggleButton.Text = "+"
-    else
-        ContentFrame.Visible = true
-        MainFrame.Size = UDim2.new(0, 300, 0, 350)
-        ToggleButton.Text = "-"
-    end
-end)
-
--- Cleanup Handler
-local function cleanup()
-    isRunning = false
-    if currentTask then task.cancel(currentTask) end
-    ScreenGui:Destroy()
 end
 
--- Respawn Logic
+-- Anti-Stuck Loop
+task.spawn(function()
+    local lastPos = nil
+    while true do
+        task.wait(2)
+        if isRunning then
+            local root = getRoot()
+            if lastPos and (root.Position - lastPos).Magnitude < 2 then
+                -- Stuck!
+                local humanoid = getHumanoid()
+                humanoid.Jump = true
+
+                -- Unstuck move
+                local randomOffset = Vector3.new(math.random(-5, 5), 0, math.random(-5, 5))
+                humanoid:MoveTo(root.Position + randomOffset)
+                task.wait(0.5)
+            end
+            lastPos = root.Position
+        end
+    end
+end)
+
+-- UI Setup (Rayfield)
+local Window = Rayfield:CreateWindow({
+   Name = "BSS Macro V2.0",
+   LoadingTitle = "Loading Macro...",
+   LoadingSubtitle = "By Jules",
+   ConfigurationSaving = {
+      Enabled = false,
+   },
+   KeySystem = false,
+})
+
+local MainTab = Window:CreateTab("Main", 4483362458)
+
+local Section = MainTab:CreateSection("Configuration")
+
+local FieldDropdown = MainTab:CreateDropdown({
+   Name = "Select Field",
+   Options = ZONE_NAMES,
+   CurrentOption = "",
+   Flag = "FieldDropdown",
+   Callback = function(Option)
+       local fieldName = Option[1]
+       SelectedField = getFieldPosition(fieldName)
+   end,
+})
+
+local PatternDropdown = MainTab:CreateDropdown({
+   Name = "Pattern",
+   Options = {"Spiral", "Snake", "Circle", "Figure-8", "Random"},
+   CurrentOption = "Spiral",
+   Flag = "PatternDropdown",
+   Callback = function(Option)
+       Pattern = Option[1]
+   end,
+})
+
+local ModeToggle = MainTab:CreateToggle({
+   Name = "Tween Mode",
+   CurrentValue = false,
+   Flag = "ModeToggle",
+   Callback = function(Value)
+       if Value then
+           MovementMode = "Tween"
+       else
+           MovementMode = "Walk"
+       end
+   end,
+})
+
+local SpeedSlider = MainTab:CreateSlider({
+   Name = "Tween Speed",
+   Range = {10, 100},
+   Increment = 1,
+   Suffix = "Studs/s",
+   CurrentValue = 30,
+   Flag = "SpeedSlider",
+   Callback = function(Value)
+       TweenSpeed = Value
+   end,
+})
+
+local SprintToggle = MainTab:CreateToggle({
+   Name = "Auto-Sprint",
+   CurrentValue = false,
+   Flag = "SprintToggle",
+   Callback = function(Value)
+       AutoSprint = Value
+   end,
+})
+
+local ControlSection = MainTab:CreateSection("Control")
+
+local ToggleBtn = MainTab:CreateButton({
+   Name = "START / STOP",
+   Callback = function()
+       if isRunning then
+           -- Stop
+           isRunning = false
+           Rayfield:Notify({Title = "Status", Content = "Macro Stopped", Duration = 3})
+           if currentTask then
+               task.cancel(currentTask)
+               currentTask = nil
+           end
+
+           -- Stop Character
+           local root = getRoot()
+           local humanoid = getHumanoid()
+           humanoid:MoveTo(root.Position)
+       else
+           -- Start
+           if not SelectedField then
+               Rayfield:Notify({Title = "Error", Content = "Please select a field first!", Duration = 3})
+               return
+           end
+
+           isRunning = true
+           Rayfield:Notify({Title = "Status", Content = "Macro Started", Duration = 3})
+           currentTask = task.spawn(mainLoop)
+       end
+   end,
+})
+
+-- Handle Character Respawn
 LocalPlayer.CharacterAdded:Connect(function()
     isRunning = false
-    StartStopBtn.Text = "START"
-    StartStopBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 0)
     if currentTask then task.cancel(currentTask) end
 end)
